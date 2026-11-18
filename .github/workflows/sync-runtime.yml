@@ -1,0 +1,50 @@
+name: Đồng bộ runtime .NET
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Phiên bản runtime .NET (vd 10.0.16)'
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tải và kiểm SHA-512 theo releases.json của Microsoft
+        id: fetch
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.version }}".Trim()
+          $major = $ver.Split('.')[0] + '.' + $ver.Split('.')[1]
+          $meta = Invoke-RestMethod "https://builds.dotnet.microsoft.com/dotnet/release-metadata/$major/releases.json"
+          $rel = $meta.releases | Where-Object { $_.'release-version' -eq $ver } | Select-Object -First 1
+          if (-not $rel) { Write-Error "Không có bản $ver trong releases.json"; exit 1 }
+          $want = @(
+            @{ Group = 'runtime';        Name = 'dotnet-runtime-win-x64.zip' },
+            @{ Group = 'windowsdesktop'; Name = 'windowsdesktop-runtime-win-x64.zip' },
+            @{ Group = 'windowsdesktop'; Name = 'windowsdesktop-runtime-win-x64.exe' }
+          )
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          $table = "| Tệp | Byte | SHA-512 |`n|---|---|---|`n"
+          foreach ($w in $want) {
+            $f = $rel.($w.Group).files | Where-Object { $_.name -eq $w.Name } | Select-Object -First 1
+            if (-not $f) { Write-Error "Thiếu $($w.Name)"; exit 1 }
+            $file = Join-Path out ([IO.Path]::GetFileName($f.url))
+            Invoke-WebRequest $f.url -OutFile $file
+            $sha = (Get-FileHash $file -Algorithm SHA512).Hash.ToLowerInvariant()
+            if ($sha -ne $f.hash.ToLowerInvariant()) { Write-Error "$file sai SHA-512"; exit 1 }
+            $table += "| $([IO.Path]::GetFileName($file)) | $((Get-Item $file).Length) | ``$sha`` |`n"
+          }
+          $security = if ($rel.security) { 'Có (bản vá bảo mật)' } else { 'Không' }
+          "### .NET $ver (Microsoft)`n`nBản vá bảo mật: $security`n`n$table`nNguồn: builds.dotnet.microsoft.com, SHA-512 khớp releases.json." | Set-Content notes.md -Encoding utf8
+
+      - name: Tạo release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" out/* --repo "${{ github.repository }}" --title ".NET ${{ inputs.version }}" --notes-file notes.md
